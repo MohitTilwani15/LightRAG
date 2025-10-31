@@ -12,7 +12,6 @@ from fastapi.openapi.docs import (
 import os
 import logging
 import logging.config
-import signal
 import sys
 import uvicorn
 import pipmaster as pm
@@ -82,24 +81,6 @@ config.read("config.ini")
 auth_configured = bool(auth_handler.accounts)
 
 
-def setup_signal_handlers():
-    """Setup signal handlers for graceful shutdown"""
-
-    def signal_handler(sig, frame):
-        print(f"\n\nReceived signal {sig}, shutting down gracefully...")
-        print(f"Process ID: {os.getpid()}")
-
-        # Release shared resources
-        finalize_share_data()
-
-        # Exit with success status
-        sys.exit(0)
-
-    # Register signal handlers
-    signal.signal(signal.SIGINT, signal_handler)  # Ctrl+C
-    signal.signal(signal.SIGTERM, signal_handler)  # kill command
-
-
 class LLMConfigCache:
     """Smart LLM and Embedding configuration cache class"""
 
@@ -150,7 +131,11 @@ class LLMConfigCache:
 
 
 def check_frontend_build():
-    """Check if frontend is built and optionally check if source is up-to-date"""
+    """Check if frontend is built and optionally check if source is up-to-date
+
+    Returns:
+        bool: True if frontend is outdated, False if up-to-date or production environment
+    """
     webui_dir = Path(__file__).parent / "webui"
     index_html = webui_dir / "index.html"
 
@@ -185,7 +170,7 @@ def check_frontend_build():
             logger.debug(
                 "Production environment detected, skipping source freshness check"
             )
-            return
+            return False
 
         # Development environment, perform source code timestamp check
         logger.debug("Development environment detected, checking source freshness")
@@ -216,7 +201,7 @@ def check_frontend_build():
             source_dir / "bun.lock",
             source_dir / "vite.config.ts",
             source_dir / "tsconfig.json",
-            source_dir / "tailwind.config.js",
+            source_dir / "tailraid.config.js",
             source_dir / "index.html",
         ]
 
@@ -260,17 +245,25 @@ def check_frontend_build():
             ASCIIColors.cyan("    cd ..")
             ASCIIColors.yellow("\nThe server will continue with the current build.")
             ASCIIColors.yellow("=" * 80 + "\n")
+            return True  # Frontend is outdated
         else:
             logger.info("Frontend build is up-to-date")
+            return False  # Frontend is up-to-date
 
     except Exception as e:
         # If check fails, log warning but don't affect startup
         logger.warning(f"Failed to check frontend source freshness: {e}")
+        return False  # Assume up-to-date on error
 
 
 def create_app(args):
-    # Check frontend build first
-    check_frontend_build()
+    # Check frontend build first and get outdated status
+    is_frontend_outdated = check_frontend_build()
+
+    # Create unified API version display with warning symbol if frontend is outdated
+    api_version_display = (
+        f"{__api_version__}⚠️" if is_frontend_outdated else __api_version__
+    )
 
     # Setup logging
     logger.setLevel(args.log_level)
@@ -345,8 +338,15 @@ def create_app(args):
             # Clean up database connections
             await rag.finalize_storages()
 
-            # Clean up shared data
-            finalize_share_data()
+            if "LIGHTRAG_GUNICORN_MODE" not in os.environ:
+                # Only perform cleanup in Uvicorn single-process mode
+                logger.debug("Unvicorn Mode: finalizing shared storage...")
+                finalize_share_data()
+            else:
+                # In Gunicorn mode with preload_app=True, cleanup is handled by on_exit hooks
+                logger.debug(
+                    "Gunicorn Mode: postpone shared storage finalization to master process"
+                )
 
     # Initialize FastAPI
     base_description = (
@@ -813,7 +813,7 @@ def create_app(args):
                 "auth_mode": "disabled",
                 "message": "Authentication is disabled. Using guest access.",
                 "core_version": core_version,
-                "api_version": __api_version__,
+                "api_version": api_version_display,
                 "webui_title": webui_title,
                 "webui_description": webui_description,
             }
@@ -822,7 +822,7 @@ def create_app(args):
             "auth_configured": True,
             "auth_mode": "enabled",
             "core_version": core_version,
-            "api_version": __api_version__,
+            "api_version": api_version_display,
             "webui_title": webui_title,
             "webui_description": webui_description,
         }
@@ -840,7 +840,7 @@ def create_app(args):
                 "auth_mode": "disabled",
                 "message": "Authentication is disabled. Using guest access.",
                 "core_version": core_version,
-                "api_version": __api_version__,
+                "api_version": api_version_display,
                 "webui_title": webui_title,
                 "webui_description": webui_description,
             }
@@ -857,7 +857,7 @@ def create_app(args):
             "token_type": "bearer",
             "auth_mode": "enabled",
             "core_version": core_version,
-            "api_version": __api_version__,
+            "api_version": api_version_display,
             "webui_title": webui_title,
             "webui_description": webui_description,
         }
@@ -921,7 +921,7 @@ def create_app(args):
                 "pipeline_busy": pipeline_status.get("busy", False),
                 "keyed_locks": keyed_lock_info,
                 "core_version": core_version,
-                "api_version": __api_version__,
+                "api_version": api_version_display,
                 "webui_title": webui_title,
                 "webui_description": webui_description,
             }
@@ -1108,8 +1108,10 @@ def main():
     update_uvicorn_mode_config()
     display_splash_screen(global_args)
 
-    # Setup signal handlers for graceful shutdown
-    setup_signal_handlers()
+    # Note: Signal handlers are NOT registered here because:
+    # - Uvicorn has built-in signal handling that properly calls lifespan shutdown
+    # - Custom signal handlers can interfere with uvicorn's graceful shutdown
+    # - Cleanup is handled by the lifespan context manager's finally block
 
     # Create application instance directly instead of using factory function
     app = create_app(global_args)
