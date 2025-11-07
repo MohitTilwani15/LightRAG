@@ -13,6 +13,7 @@ from lightrag.utils import (
     logger,
     compute_mdhash_id,
     Tokenizer,
+    TokenTracker,
     is_float_regex,
     sanitize_and_normalize_extracted_text,
     pack_user_ass_to_openai_messages,
@@ -36,6 +37,7 @@ from lightrag.utils import (
     apply_source_ids_limit,
     merge_source_ids,
     make_relation_chunk_key,
+    call_llm_with_tracker,
 )
 from lightrag.base import (
     BaseGraphStorage,
@@ -146,6 +148,118 @@ def chunking_by_token_size(
                 }
             )
     return results
+
+def _get_normalized_file_filters(query_param: QueryParam | None) -> list[str]:
+    """Prepare normalized (lower-cased) file path filters from the query parameters."""
+    if query_param is None:
+        return []
+
+    filters = getattr(query_param, "file_path_filters", None)
+    if not filters:
+        return []
+
+    normalized_filters: list[str] = []
+    for value in filters:
+        if isinstance(value, str):
+            trimmed = value.strip()
+            if trimmed:
+                normalized_filters.append(trimmed.lower())
+
+    # Remove duplicates while preserving order
+    seen = set()
+    deduped_filters: list[str] = []
+    for value in normalized_filters:
+        if value not in seen:
+            seen.add(value)
+            deduped_filters.append(value)
+    return deduped_filters
+
+
+def _split_file_path_values(file_path_value: Any) -> list[str]:
+    """Split stored file_path metadata into comparable parts."""
+    if not file_path_value or file_path_value == "unknown_source":
+        return []
+
+    paths: list[str] = []
+    # Support strings, lists, or other iterables
+    if isinstance(file_path_value, list):
+        iterable = file_path_value
+    else:
+        iterable = [file_path_value]
+
+    for item in iterable:
+        if item is None:
+            continue
+        item_str = str(item)
+        if not item_str:
+            continue
+        fragments = split_string_by_multi_markers(item_str, [GRAPH_FIELD_SEP])
+        for fragment in fragments:
+            fragment = fragment.strip()
+            if fragment:
+                paths.append(fragment)
+    return paths
+
+
+def _file_path_matches(file_path_value: Any, normalized_filters: list[str]) -> bool:
+    """Return True when the stored file path metadata matches any filter substring."""
+    if not normalized_filters:
+        return True
+
+    candidate_paths = _split_file_path_values(file_path_value)
+    if not candidate_paths:
+        return False
+
+    for candidate in candidate_paths:
+        lower_candidate = candidate.lower()
+        candidate_basename = Path(candidate).name.lower()
+        for filter_value in normalized_filters:
+            if filter_value in lower_candidate or filter_value in candidate_basename:
+                return True
+    return False
+
+
+def _filter_items_by_file_path(
+    items: list[dict],
+    normalized_filters: list[str],
+) -> list[dict]:
+    """Filter entity/relation dictionaries by file path metadata."""
+    if not normalized_filters:
+        return items
+
+    filtered: list[dict] = []
+    for item in items:
+        if _file_path_matches(item.get("file_path"), normalized_filters):
+            filtered.append(item)
+    return filtered
+
+
+def _filter_vector_chunks_by_file_path(
+    vector_chunks: list[dict],
+    normalized_filters: list[str],
+    chunk_tracking: dict | None = None,
+) -> list[dict]:
+    """Filter vector chunk results and prune chunk tracking accordingly."""
+    if not normalized_filters:
+        return vector_chunks
+
+    filtered_chunks: list[dict] = []
+    allowed_chunk_ids: set[str] = set()
+
+    for chunk in vector_chunks:
+        if _file_path_matches(chunk.get("file_path"), normalized_filters):
+            filtered_chunks.append(chunk)
+            chunk_id = chunk.get("chunk_id") or chunk.get("id")
+            if chunk_id:
+                allowed_chunk_ids.add(chunk_id)
+
+    if chunk_tracking is not None:
+        for chunk_id in list(chunk_tracking.keys()):
+            tracking_source = chunk_tracking[chunk_id].get("source")
+            if tracking_source == "C" and chunk_id not in allowed_chunk_ids:
+                del chunk_tracking[chunk_id]
+
+    return filtered_chunks
 
 
 async def _handle_entity_relation_summary(
@@ -2993,6 +3107,7 @@ async def kg_query(
     hashing_kv: BaseKVStorage | None = None,
     system_prompt: str | None = None,
     chunks_vdb: BaseVectorStorage = None,
+    token_tracker: TokenTracker | None = None,
 ) -> QueryResult | None:
     """
     Execute knowledge graph query and return unified QueryResult object.
@@ -3007,6 +3122,7 @@ async def kg_query(
         global_config: Global configuration
         hashing_kv: Cache storage
         system_prompt: System prompt
+        token_tracker: Optional TokenTracker for aggregating token usage
         chunks_vdb: Document chunks vector database
 
     Returns:
@@ -3035,8 +3151,19 @@ async def kg_query(
         use_model_func = partial(use_model_func, _priority=5)
 
     hl_keywords, ll_keywords = await get_keywords_from_query(
-        query, query_param, global_config, hashing_kv
+        query,
+        query_param,
+        global_config,
+        hashing_kv,
+        token_tracker=token_tracker,
     )
+
+    def _attach_token_usage(raw_data: dict[str, Any] | None) -> dict[str, Any] | None:
+        if raw_data is None or token_tracker is None:
+            return raw_data
+        metadata = raw_data.setdefault("metadata", {})
+        metadata["token_usage"] = token_tracker.get_usage()
+        return raw_data
 
     logger.debug(f"High-level keywords: {hl_keywords}")
     logger.debug(f"Low-level  keywords: {ll_keywords}")
@@ -3075,9 +3202,8 @@ async def kg_query(
 
     # Return different content based on query parameters
     if query_param.only_need_context and not query_param.only_need_prompt:
-        return QueryResult(
-            content=context_result.context, raw_data=context_result.raw_data
-        )
+        raw_data = _attach_token_usage(context_result.raw_data)
+        return QueryResult(content=context_result.context, raw_data=raw_data)
 
     user_prompt = f"\n\n{query_param.user_prompt}" if query_param.user_prompt else "n/a"
     response_type = (
@@ -3098,7 +3224,8 @@ async def kg_query(
 
     if query_param.only_need_prompt:
         prompt_content = "\n\n".join([sys_prompt, "---User Query---", user_query])
-        return QueryResult(content=prompt_content, raw_data=context_result.raw_data)
+        raw_data = _attach_token_usage(context_result.raw_data)
+        return QueryResult(content=prompt_content, raw_data=raw_data)
 
     # Call LLM
     tokenizer: Tokenizer = global_config["tokenizer"]
@@ -3134,12 +3261,14 @@ async def kg_query(
         )
         response = cached_response
     else:
-        response = await use_model_func(
+        response = await call_llm_with_tracker(
+            use_model_func,
             user_query,
             system_prompt=sys_prompt,
             history_messages=query_param.conversation_history,
             enable_cot=True,
             stream=query_param.stream,
+            token_tracker=token_tracker,
         )
 
         if hashing_kv and hashing_kv.global_config.get("enable_llm_cache"):
@@ -3182,12 +3311,14 @@ async def kg_query(
                 .strip()
             )
 
-        return QueryResult(content=response, raw_data=context_result.raw_data)
+        raw_data = _attach_token_usage(context_result.raw_data)
+        return QueryResult(content=response, raw_data=raw_data)
     else:
         # Streaming response (AsyncIterator)
+        raw_data = _attach_token_usage(context_result.raw_data)
         return QueryResult(
             response_iterator=response,
-            raw_data=context_result.raw_data,
+            raw_data=raw_data,
             is_streaming=True,
         )
 
@@ -3197,6 +3328,7 @@ async def get_keywords_from_query(
     query_param: QueryParam,
     global_config: dict[str, str],
     hashing_kv: BaseKVStorage | None = None,
+    token_tracker: TokenTracker | None = None,
 ) -> tuple[list[str], list[str]]:
     """
     Retrieves high-level and low-level keywords for RAG operations.
@@ -3209,6 +3341,7 @@ async def get_keywords_from_query(
         query_param: Query parameters that may contain pre-defined keywords
         global_config: Global configuration dictionary
         hashing_kv: Optional key-value storage for caching results
+        token_tracker: Optional TokenTracker to aggregate keyword extraction usage
 
     Returns:
         A tuple containing (high_level_keywords, low_level_keywords)
@@ -3219,7 +3352,11 @@ async def get_keywords_from_query(
 
     # Extract keywords using extract_keywords_only function which already supports conversation history
     hl_keywords, ll_keywords = await extract_keywords_only(
-        query, query_param, global_config, hashing_kv
+        query,
+        query_param,
+        global_config,
+        hashing_kv,
+        token_tracker=token_tracker,
     )
     return hl_keywords, ll_keywords
 
@@ -3229,11 +3366,19 @@ async def extract_keywords_only(
     param: QueryParam,
     global_config: dict[str, str],
     hashing_kv: BaseKVStorage | None = None,
+    token_tracker: TokenTracker | None = None,
 ) -> tuple[list[str], list[str]]:
     """
     Extract high-level and low-level keywords from the given 'text' using the LLM.
     This method does NOT build the final RAG context or provide a final answer.
     It ONLY extracts keywords (hl_keywords, ll_keywords).
+
+    Args:
+        text: Input text to analyze for keywords.
+        param: Query parameters controlling keyword extraction.
+        global_config: Global configuration dictionary.
+        hashing_kv: Optional cache storage to reuse previous keyword calls.
+        token_tracker: Optional TokenTracker to aggregate keyword extraction usage.
     """
 
     # 1. Handle cache if needed - add cache type for keywords
@@ -3282,7 +3427,12 @@ async def extract_keywords_only(
         # Apply higher priority (5) to query relation LLM function
         use_model_func = partial(use_model_func, _priority=5)
 
-    result = await use_model_func(kw_prompt, keyword_extraction=True)
+    result = await call_llm_with_tracker(
+        use_model_func,
+        kw_prompt,
+        keyword_extraction=True,
+        token_tracker=token_tracker,
+    )
 
     # 5. Parse out JSON from the LLM response
     result = remove_think_tags(result)
@@ -3380,6 +3530,20 @@ async def _get_vector_context(
                 }
                 valid_chunks.append(chunk_with_metadata)
 
+        normalized_filters = _get_normalized_file_filters(query_param)
+        if normalized_filters:
+            original_len = len(valid_chunks)
+            valid_chunks = [
+                chunk
+                for chunk in valid_chunks
+                if _file_path_matches(chunk.get("file_path"), normalized_filters)
+            ]
+            logger.info(
+                "Vector chunk filter applied %s -> %d/%d",
+                query_param.file_path_filters,
+                len(valid_chunks),
+                original_len,
+            )
         logger.info(
             f"Naive query: {len(valid_chunks)} chunks (chunk_top_k:{search_top_k} cosine:{cosine_threshold})"
         )
@@ -3545,6 +3709,34 @@ async def _perform_kg_search(
             if rel_key not in seen_relations:
                 final_relations.append(relation)
                 seen_relations.add(rel_key)
+    
+    normalized_file_filters = _get_normalized_file_filters(query_param)
+    if normalized_file_filters:
+        original_counts = (
+            len(final_entities),
+            len(final_relations),
+            len(vector_chunks),
+        )
+        final_entities = _filter_items_by_file_path(
+            final_entities, normalized_file_filters
+        )
+        final_relations = _filter_items_by_file_path(
+            final_relations, normalized_file_filters
+        )
+        vector_chunks = _filter_vector_chunks_by_file_path(
+            vector_chunks, normalized_file_filters, chunk_tracking
+        )
+
+        logger.info(
+            "Applied file path filters %s -> entities %d/%d, relations %d/%d, vector chunks %d/%d",
+            query_param.file_path_filters,
+            len(final_entities),
+            original_counts[0],
+            len(final_relations),
+            original_counts[1],
+            len(vector_chunks),
+            original_counts[2],
+        )
 
     logger.info(
         f"Raw search results: {len(final_entities)} entities, {len(final_relations)} relations, {len(vector_chunks)} vector chunks"
@@ -3828,6 +4020,35 @@ async def _merge_all_chunks(
     logger.info(
         f"Round-robin merged chunks: {origin_len} -> {len(merged_chunks)} (deduplicated {origin_len - len(merged_chunks)})"
     )
+
+    normalized_filters = _get_normalized_file_filters(query_param)
+    if normalized_filters:
+        original_len = len(merged_chunks)
+        merged_chunks = [
+            chunk
+            for chunk in merged_chunks
+            if _file_path_matches(chunk.get("file_path"), normalized_filters)
+        ]
+        if chunk_tracking is not None:
+            remaining_ids = {
+                chunk.get("chunk_id")
+                for chunk in merged_chunks
+                if chunk.get("chunk_id")
+            }
+            for chunk_id in list(chunk_tracking.keys()):
+                is_known_source = chunk_tracking[chunk_id].get("source") in {
+                    "C",
+                    "E",
+                    "R",
+                }
+                if is_known_source and chunk_id not in remaining_ids:
+                    del chunk_tracking[chunk_id]
+        logger.info(
+            "Merged chunks filtered by file paths %s -> %d/%d",
+            query_param.file_path_filters,
+            len(merged_chunks),
+            original_len,
+        )
 
     return merged_chunks
 
@@ -4270,10 +4491,16 @@ async def _find_related_text_unit_from_entities(
 
     if not node_datas:
         return []
+    
+    normalized_filters = _get_normalized_file_filters(query_param)
 
     # Step 1: Collect all text chunks for each entity
     entities_with_chunks = []
     for entity in node_datas:
+        if normalized_filters and not _file_path_matches(
+            entity.get("file_path"), normalized_filters
+        ):
+            continue
         if entity.get("source_id"):
             chunks = split_string_by_multi_markers(
                 entity["source_id"], [GRAPH_FIELD_SEP]
@@ -4396,6 +4623,10 @@ async def _find_related_text_unit_from_entities(
     result_chunks = []
     for i, (chunk_id, chunk_data) in enumerate(zip(unique_chunk_ids, chunk_data_list)):
         if chunk_data is not None and "content" in chunk_data:
+            if normalized_filters and not _file_path_matches(
+                chunk_data.get("file_path"), normalized_filters
+            ):
+                continue
             chunk_data_copy = chunk_data.copy()
             chunk_data_copy["source_type"] = "entity"
             chunk_data_copy["chunk_id"] = chunk_id  # Add chunk_id for deduplication
@@ -4522,10 +4753,16 @@ async def _find_related_text_unit_from_relations(
 
     if not edge_datas:
         return []
+    
+    normalized_filters = _get_normalized_file_filters(query_param)
 
     # Step 1: Collect all text chunks for each relationship
     relations_with_chunks = []
     for relation in edge_datas:
+        if normalized_filters and not _file_path_matches(
+            relation.get("file_path"), normalized_filters
+        ):
+            continue
         if relation.get("source_id"):
             chunks = split_string_by_multi_markers(
                 relation["source_id"], [GRAPH_FIELD_SEP]
@@ -4691,6 +4928,10 @@ async def _find_related_text_unit_from_relations(
     result_chunks = []
     for i, (chunk_id, chunk_data) in enumerate(zip(unique_chunk_ids, chunk_data_list)):
         if chunk_data is not None and "content" in chunk_data:
+            if normalized_filters and not _file_path_matches(
+                chunk_data.get("file_path"), normalized_filters
+            ):
+                continue
             chunk_data_copy = chunk_data.copy()
             chunk_data_copy["source_type"] = "relationship"
             chunk_data_copy["chunk_id"] = chunk_id  # Add chunk_id for deduplication
@@ -4715,6 +4956,7 @@ async def naive_query(
     global_config: dict[str, str],
     hashing_kv: BaseKVStorage | None = None,
     system_prompt: str | None = None,
+    token_tracker: TokenTracker | None = None,
     return_raw_data: Literal[True] = True,
 ) -> dict[str, Any]: ...
 
@@ -4727,6 +4969,7 @@ async def naive_query(
     global_config: dict[str, str],
     hashing_kv: BaseKVStorage | None = None,
     system_prompt: str | None = None,
+    token_tracker: TokenTracker | None = None,
     return_raw_data: Literal[False] = False,
 ) -> str | AsyncIterator[str]: ...
 
@@ -4738,6 +4981,7 @@ async def naive_query(
     global_config: dict[str, str],
     hashing_kv: BaseKVStorage | None = None,
     system_prompt: str | None = None,
+    token_tracker: TokenTracker | None = None,
 ) -> QueryResult | None:
     """
     Execute naive query and return unified QueryResult object.
@@ -4859,6 +5103,8 @@ async def naive_query(
         "total_chunks_found": len(chunks),
         "final_chunks_count": len(processed_chunks_with_ref_ids),
     }
+    if token_tracker is not None:
+        raw_data["metadata"]["token_usage"] = token_tracker.get_usage()
 
     # Build chunks_context from processed chunks with reference IDs
     chunks_context = []
@@ -4923,12 +5169,14 @@ async def naive_query(
         )
         response = cached_response
     else:
-        response = await use_model_func(
+        response = await call_llm_with_tracker(
+            use_model_func,
             user_query,
             system_prompt=sys_prompt,
             history_messages=query_param.conversation_history,
             enable_cot=True,
             stream=query_param.stream,
+            token_tracker=token_tracker,
         )
 
         if hashing_kv and hashing_kv.global_config.get("enable_llm_cache"):

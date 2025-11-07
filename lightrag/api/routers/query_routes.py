@@ -103,6 +103,11 @@ class QueryRequest(BaseModel):
         description="If True, includes reference list in responses. Affects /query and /query/stream endpoints. /query/data always includes references.",
     )
 
+    file_path_filters: Optional[List[str]] = Field(
+        default=None,
+        description="Optional list of filename/path substrings; when provided, retrieval is restricted to matching sources.",
+    )
+
     include_chunk_content: Optional[bool] = Field(
         default=False,
         description="If True, includes actual chunk text content in references. Only applies when include_references=True. Useful for evaluation and debugging.",
