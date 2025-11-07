@@ -50,6 +50,7 @@ LightRAG necessitates the integration of both an LLM (Large Language Model) and 
 * openai or openai compatible
 * azure_openai
 * aws_bedrock
+* gemini
 
 It is recommended to use environment variables to configure the LightRAG Server. There is an example environment variable file named `env.example` in the root directory of the project. Please copy this file to the startup directory and rename it to `.env`. After that, you can modify the parameters related to the LLM and Embedding models in the `.env` file. It is important to note that the LightRAG Server will load the environment variables from `.env` into the system environment variables each time it starts. **LightRAG Server will prioritize the settings in the system environment variables to .env file**.
 
@@ -71,6 +72,8 @@ EMBEDDING_MODEL=bge-m3:latest
 EMBEDDING_DIM=1024
 # EMBEDDING_BINDING_API_KEY=your_api_key
 ```
+
+> When targeting Google Gemini, set `LLM_BINDING=gemini`, choose a model such as `LLM_MODEL=gemini-flash-latest`, and provide your Gemini key via `LLM_BINDING_API_KEY` (or `GEMINI_API_KEY`).
 
 * Ollama LLM + Ollama Embedding:
 
@@ -462,6 +465,59 @@ The `/query` and `/query/stream` API endpoints include an `enable_rerank` parame
 ```
 RERANK_BY_DEFAULT=False
 ```
+
+### Include Chunk Content in References
+
+By default, the `/query` and `/query/stream` endpoints return references with only `reference_id` and `file_path`. For evaluation, debugging, or citation purposes, you can request the actual retrieved chunk content to be included in references.
+
+The `include_chunk_content` parameter (default: `false`) controls whether the actual text content of retrieved chunks is included in the response references. This is particularly useful for:
+
+- **RAG Evaluation**: Testing systems like RAGAS that need access to retrieved contexts
+- **Debugging**: Verifying what content was actually used to generate the answer
+- **Citation Display**: Showing users the exact text passages that support the response
+- **Transparency**: Providing full visibility into the RAG retrieval process
+
+**Important**: The `content` field is an **array of strings**, where each string represents a chunk from the same file. A single file may correspond to multiple chunks, so the content is returned as a list to preserve chunk boundaries.
+
+**Example API Request:**
+
+```json
+{
+  "query": "What is LightRAG?",
+  "mode": "mix",
+  "include_references": true,
+  "include_chunk_content": true
+}
+```
+
+**Example Response (with chunk content):**
+
+```json
+{
+  "response": "LightRAG is a graph-based RAG system...",
+  "references": [
+    {
+      "reference_id": "1",
+      "file_path": "/documents/intro.md",
+      "content": [
+        "LightRAG is a retrieval-augmented generation system that combines knowledge graphs with vector similarity search...",
+        "The system uses a dual-indexing approach with both vector embeddings and graph structures for enhanced retrieval..."
+      ]
+    },
+    {
+      "reference_id": "2",
+      "file_path": "/documents/features.md",
+      "content": [
+        "The system provides multiple query modes including local, global, hybrid, and mix modes..."
+      ]
+    }
+  ]
+}
+```
+
+**Notes**:
+- This parameter only works when `include_references=true`. Setting `include_chunk_content=true` without including references has no effect.
+- **Breaking Change**: Prior versions returned `content` as a single concatenated string. Now it returns an array of strings to preserve individual chunk boundaries. If you need a single string, join the array elements with your preferred separator (e.g., `"\n\n".join(content)`).
 
 ### .env Examples
 
